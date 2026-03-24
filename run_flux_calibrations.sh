@@ -10,6 +10,7 @@ TABLE_NAME="flux_estimates"
 ARRAY_MAP="0:280,1:220,2:150"
 SMA_ALPHA="-0.7"
 DRY_RUN=0
+SUMMARY_FILE="pointing_calibration_summary.csv"
 
 usage() {
   cat <<USAGE
@@ -26,6 +27,7 @@ Options:
   -d, --db PATH                  Optional SQLite DB path (required if backend=sqlite)
   -t, --table NAME               SQLite table name (default: flux_estimates)
   -m, --array-map MAP            Array map, e.g. '0:280,1:220,2:150'
+  -s, --summary-file NAME        Summary CSV filename written under --root (default: pointing_calibration_summary.csv)
       --sma-spectral-index A     Spectral index alpha for SMA fallback (default: -0.7)
   -n, --dry-run                  Print commands without executing
   -h, --help                     Show this help
@@ -56,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -m|--array-map)
       ARRAY_MAP="$2"
+      shift 2
+      ;;
+    -s|--summary-file)
+      SUMMARY_FILE="$2"
       shift 2
       ;;
     --sma-spectral-index)
@@ -100,6 +106,7 @@ fi
 
 shopt -s nullglob
 processed=0
+summary_inputs=()
 
 for obs_dir in "$ROOT_DIR"/[0-9]*; do
   [[ -d "$obs_dir" ]] || continue
@@ -134,6 +141,7 @@ for obs_dir in "$ROOT_DIR"/[0-9]*; do
     (cd "$obs_dir" && printf '  DRY RUN: '; printf '%q ' "${cmd[@]}"; printf '\n')
   else
     (cd "$obs_dir" && "${cmd[@]}")
+    summary_inputs+=("$obs_dir/$output_file")
   fi
 
   processed=$((processed + 1))
@@ -142,6 +150,40 @@ done
 if [[ $processed -eq 0 ]]; then
   echo "No matching obsnum directories with expected ECSV files were found under: $ROOT_DIR" >&2
   exit 1
+fi
+
+summary_path="$ROOT_DIR/$SUMMARY_FILE"
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "DRY RUN: would write summary table to $summary_path"
+elif [[ ${#summary_inputs[@]} -gt 0 ]]; then
+  python - "$summary_path" "${summary_inputs[@]}" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+input_paths = [Path(p) for p in sys.argv[2:]]
+
+rows = []
+for path in input_paths:
+    obsnum = path.parent.name
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for item in data:
+        item = dict(item)
+        item["obsnum"] = obsnum
+        rows.append(item)
+
+if not rows:
+    raise SystemExit("No calibration rows found to summarize.")
+
+fieldnames = ["obsnum"] + [k for k in rows[0].keys() if k != "obsnum"]
+with summary_path.open("w", newline="", encoding="utf-8") as handle:
+    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+PY
+  echo "Wrote summary table: $summary_path"
 fi
 
 echo "Finished. Processed $processed observation director$( [[ $processed -eq 1 ]] && echo 'y' || echo 'ies' )."
