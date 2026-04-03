@@ -22,6 +22,7 @@ import argparse
 import csv
 import html
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -42,6 +43,7 @@ DEFAULT_ARRAY_MAP = {0: 280.0, 1: 220.0, 2: 150.0}
 @dataclass
 class CalibrationResult:
     source: str
+    source_elevation_deg: Optional[float]
     obs_date_utc: str
     frequency_ghz: float
     array_index: int
@@ -458,12 +460,13 @@ def format_array_map(mapping: Dict[int, float]) -> str:
 
 def load_measurements(
     ecsv_path: Path, array_to_freq: Dict[int, float]
-) -> tuple[str, datetime, Optional[str], Dict[float, Dict[str, float]]]:
+) -> tuple[str, Optional[float], datetime, Optional[str], Dict[float, Dict[str, float]]]:
     table = Table.read(str(ecsv_path), format="ascii.ecsv")
 
     source = table.meta.get("source")
     if not source:
         raise ValueError(f"ECSV metadata in {ecsv_path} is missing 'source'.")
+    source_elevation_deg = extract_source_elevation_deg(table)
     obsnum = table.meta.get("obsnum")
 
     obs_date_raw = table.meta.get("date") or table.meta.get("creation_date")
@@ -487,7 +490,64 @@ def load_measurements(
             "amp_err": float(row["amp_err"]) if has_amp_err else None,
         }
 
-    return str(source), obs_date, (str(obsnum) if obsnum is not None else None), measured_by_freq
+    return str(source), source_elevation_deg, obs_date, (str(obsnum) if obsnum is not None else None), measured_by_freq
+
+
+def _parse_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def extract_source_elevation_deg(table: Table) -> Optional[float]:
+    meta_keys = (
+        "source_elevation_deg",
+        "source_elevation",
+        "elevation_deg",
+        "elevation",
+        "source_el",
+        "el_deg",
+        "el",
+        "altitude_deg",
+        "altitude",
+        "alt_deg",
+        "alt",
+    )
+    meta_lookup = {str(k).lower(): table.meta[k] for k in table.meta}
+    for key in meta_keys:
+        val = _parse_float(meta_lookup.get(key))
+        if val is not None:
+            return val
+
+    col_names = (
+        "source_elevation_deg",
+        "source_elevation",
+        "elevation_deg",
+        "elevation",
+        "source_el",
+        "el_deg",
+        "el",
+        "altitude_deg",
+        "altitude",
+        "alt_deg",
+        "alt",
+    )
+    col_lookup = {str(c).lower(): c for c in table.colnames}
+    for col_key in col_names:
+        col_name = col_lookup.get(col_key)
+        if not col_name:
+            continue
+        for raw_val in table[col_name]:
+            val = _parse_float(raw_val)
+            if val is not None:
+                return val
+    return None
 
 
 def resolve_output_path_with_obsnum(output_path: Path, obsnum: Optional[str]) -> Path:
@@ -501,6 +561,7 @@ def resolve_output_path_with_obsnum(output_path: Path, obsnum: Optional[str]) ->
 
 def compute_calibration(
     source: str,
+    source_elevation_deg: Optional[float],
     obs_date: datetime,
     measured_by_freq: Dict[float, Dict[str, float]],
     estimator: FluxEstimator,
@@ -523,6 +584,7 @@ def compute_calibration(
         results.append(
             CalibrationResult(
                 source=source,
+                source_elevation_deg=source_elevation_deg,
                 obs_date_utc=obs_date.isoformat(sep=" "),
                 frequency_ghz=float(freq),
                 array_index=int(measured["array_index"]),
@@ -616,7 +678,7 @@ def main() -> int:
     args = build_parser().parse_args()
 
     array_map = parse_array_map(args.array_map)
-    source, obs_date, obsnum, measured_by_freq = load_measurements(args.ecsv, array_map)
+    source, source_elevation_deg, obs_date, obsnum, measured_by_freq = load_measurements(args.ecsv, array_map)
 
     sqlite_db = SQLiteFluxDatabase(args.db, table_name=args.table) if args.db else None
     if args.backend == "sqlite" and sqlite_db is None:
@@ -634,6 +696,7 @@ def main() -> int:
     try:
         results = compute_calibration(
             source=source,
+            source_elevation_deg=source_elevation_deg,
             obs_date=obs_date,
             measured_by_freq=measured_by_freq,
             estimator=estimator,
