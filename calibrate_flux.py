@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Protocol
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 from urllib.request import urlopen
 
 from astropy.table import Table
@@ -62,6 +62,14 @@ class FluxEstimate:
     backend: str
     sma_1mm_date_delta_days: Optional[float] = None
     alma_nearest_obs_days: Optional[float] = None
+
+
+@dataclass
+class SmaCatalogSource:
+    canonical_source: str
+    aliases: List[str]
+    data_url: Optional[str] = None
+    one_mm_summary: Optional[tuple[datetime, float]] = None
 
 
 class FluxEstimator(Protocol):
@@ -194,14 +202,15 @@ class SmaCatalogFluxService:
     def __init__(self, timeout_sec: float = 30.0, spectral_index: float = -0.7) -> None:
         self._timeout_sec = timeout_sec
         self._spectral_index = spectral_index
-        self._cache: Optional[Dict[str, Dict[str, tuple[datetime, float]]]] = None
+        self._cache: Optional[Dict[str, SmaCatalogSource]] = None
+        self._source_series_cache: Dict[str, List[tuple[datetime, float]]] = {}
 
     def get_estimate(self, source: str, obs_date_utc: datetime, freq_ghz: float) -> FluxEstimate:
         catalog = self._load_catalog()
         candidates = self._source_candidates(source)
 
         matched_source: Optional[str] = None
-        entry: Optional[Dict[str, tuple[datetime, float]]] = None
+        entry: Optional[SmaCatalogSource] = None
         for candidate in candidates:
             if candidate in catalog:
                 matched_source = candidate
@@ -211,10 +220,7 @@ class SmaCatalogFluxService:
         if entry is None:
             raise LookupError(f"SMA catalog has no entry matching source={source!r} (candidates={candidates}).")
 
-        if "1mm" not in entry:
-            raise LookupError(f"SMA catalog source={matched_source!r} does not have a 1mm flux entry.")
-
-        one_mm_date, one_mm_flux_jy = entry["1mm"]
+        one_mm_date, one_mm_flux_jy = self._find_nearest_1mm_measurement(entry=entry, obs_date_utc=obs_date_utc)
         if one_mm_flux_jy <= 0.0:
             raise LookupError(f"SMA catalog has non-positive flux values for source={matched_source!r}.")
 
@@ -222,7 +228,7 @@ class SmaCatalogFluxService:
         delta_days = (obs_date_utc - one_mm_date).total_seconds() / 86400.0
 
         print(
-            f"SMA fallback used for source {matched_source} at {freq_ghz:g} GHz "
+            f"SMA fallback used for source {entry.canonical_source} at {freq_ghz:g} GHz "
             f"(1mm_date={one_mm_date.date()}, alpha={self._spectral_index:.3f}, delta_days={delta_days:.2f})",
             file=sys.stderr,
         )
@@ -233,7 +239,7 @@ class SmaCatalogFluxService:
             sma_1mm_date_delta_days=delta_days,
         )
 
-    def _load_catalog(self) -> Dict[str, Dict[str, tuple[datetime, float]]]:
+    def _load_catalog(self) -> Dict[str, SmaCatalogSource]:
         if self._cache is not None:
             return self._cache
 
@@ -246,9 +252,8 @@ class SmaCatalogFluxService:
 
         table_html = table_match.group(0)
         row_html_list = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, flags=re.S | re.I)
-        catalog: Dict[str, Dict[str, tuple[datetime, float]]] = {}
-
-        current_source: Optional[str] = None
+        index: Dict[str, SmaCatalogSource] = {}
+        current_entry: Optional[SmaCatalogSource] = None
         for row_html in row_html_list:
             raw_cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.S | re.I)
             if not raw_cells:
@@ -261,17 +266,24 @@ class SmaCatalogFluxService:
 
             if len(cells) >= 8:
                 # Full row with source columns and a band entry.
-                current_source = cells[1]
+                common_name = cells[0]
+                iau_name = cells[1]
+                aliases = [iau_name]
+                if common_name and common_name != "--":
+                    aliases.append(common_name)
+                data_url = self._extract_data_url(raw_cells[8]) if len(raw_cells) >= 9 else None
+                current_entry = SmaCatalogSource(canonical_source=iau_name, aliases=aliases, data_url=data_url)
+                self._index_source(index=index, source_entry=current_entry)
                 band = cells[4]
                 date_text = cells[5]
                 flux_text = cells[7]
-            elif len(cells) >= 4 and current_source:
+            elif len(cells) >= 4 and current_entry:
                 # Continuation row (typically the second band for same source).
                 band = cells[0]
                 date_text = cells[1]
                 flux_text = cells[3]
 
-            if not current_source or not band or not date_text or not flux_text:
+            if not current_entry or not band or not date_text or not flux_text:
                 continue
 
             band_key = self._normalize_band(band)
@@ -280,11 +292,10 @@ class SmaCatalogFluxService:
 
             date_val = self._parse_sma_date(date_text)
             flux_val = self._parse_flux_jy(flux_text)
-            key = self._normalize_source(current_source)
-            catalog.setdefault(key, {})[band_key] = (date_val, flux_val)
+            current_entry.one_mm_summary = (date_val, flux_val)
 
-        self._cache = catalog
-        return catalog
+        self._cache = index
+        return index
 
     @staticmethod
     def _clean_cell(text: str) -> str:
@@ -294,6 +305,19 @@ class SmaCatalogFluxService:
     @staticmethod
     def _normalize_source(source: str) -> str:
         return source.strip().upper().replace(" ", "")
+
+    def _index_source(self, index: Dict[str, SmaCatalogSource], source_entry: SmaCatalogSource) -> None:
+        for alias in source_entry.aliases:
+            normalized_alias = self._normalize_source(alias)
+            if not normalized_alias:
+                continue
+            index[normalized_alias] = source_entry
+
+            # Add J/no-J variants because pointing metadata can differ.
+            if normalized_alias.startswith("J"):
+                index[normalized_alias[1:]] = source_entry
+            else:
+                index[f"J{normalized_alias}"] = source_entry
 
     def _source_candidates(self, source: str) -> List[str]:
         s = self._normalize_source(source)
@@ -321,6 +345,13 @@ class SmaCatalogFluxService:
         return t
 
     @staticmethod
+    def _extract_data_url(cell_html: str) -> Optional[str]:
+        match = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>\s*data\s*</a>', cell_html, flags=re.I)
+        if not match:
+            return None
+        return html.unescape(match.group(1)).strip()
+
+    @staticmethod
     def _parse_sma_date(text: str) -> datetime:
         return datetime.strptime(text.strip(), "%d %b %Y")
 
@@ -331,6 +362,54 @@ class SmaCatalogFluxService:
         if not match:
             raise ValueError(f"Could not parse SMA flux from {text!r}")
         return float(match.group(0))
+
+    def _find_nearest_1mm_measurement(self, entry: SmaCatalogSource, obs_date_utc: datetime) -> tuple[datetime, float]:
+        measurements: List[tuple[datetime, float]] = []
+        if entry.data_url:
+            measurements = self._load_source_measurements(entry.data_url)
+        if not measurements and entry.one_mm_summary is not None:
+            measurements = [entry.one_mm_summary]
+        if not measurements:
+            raise LookupError(f"SMA source={entry.canonical_source!r} does not have any 1mm measurements.")
+        return min(measurements, key=lambda m: abs((m[0] - obs_date_utc).total_seconds()))
+
+    def _load_source_measurements(self, data_url: str) -> List[tuple[datetime, float]]:
+        if data_url in self._source_series_cache:
+            return self._source_series_cache[data_url]
+
+        url = urljoin(self.CATALOG_URL, data_url)
+        with urlopen(url, timeout=self._timeout_sec) as response:
+            html_text = response.read().decode("iso-8859-1", errors="replace")
+
+        pre_match = re.search(r"<pre[^>]*>(.*?)</pre>", html_text, flags=re.S | re.I)
+        if not pre_match:
+            self._source_series_cache[data_url] = []
+            return []
+
+        pre_text = html.unescape(pre_match.group(1))
+        measurements: List[tuple[datetime, float]] = []
+        for raw_line in pre_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            if self._normalize_band(fields[0]) != "1mm":
+                continue
+
+            date_text = " ".join(fields[1:4])
+            timestamp_text = fields[4]
+            flux_text = fields[7]
+            try:
+                obs_dt = datetime.strptime(f"{date_text} {timestamp_text}", "%d %b %Y %H:%M")
+                flux_jy = float(flux_text)
+            except ValueError:
+                continue
+            measurements.append((obs_dt, flux_jy))
+
+        self._source_series_cache[data_url] = measurements
+        return measurements
 
 
 def parse_obs_datetime(raw: object) -> datetime:
