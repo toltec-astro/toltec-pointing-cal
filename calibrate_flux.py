@@ -466,7 +466,7 @@ def load_measurements(
     source = table.meta.get("source")
     if not source:
         raise ValueError(f"ECSV metadata in {ecsv_path} is missing 'source'.")
-    source_elevation_deg = extract_source_elevation_deg(table)
+    source_elevation_deg = extract_source_elevation_deg(table=table, ecsv_path=ecsv_path)
     obsnum = table.meta.get("obsnum")
 
     obs_date_raw = table.meta.get("date") or table.meta.get("creation_date")
@@ -505,7 +505,67 @@ def _parse_float(value: object) -> Optional[float]:
     return parsed
 
 
-def extract_source_elevation_deg(table: Table) -> Optional[float]:
+def _as_degrees_if_needed(value: float) -> float:
+    # Elevation is occasionally stored in radians in telescope header fields.
+    if abs(value) <= (math.pi + 0.1):
+        return math.degrees(value)
+    return value
+
+
+def _extract_elevation_from_fits(ecsv_path: Path, obsnum: Optional[object]) -> Optional[float]:
+    obs_text = str(obsnum) if obsnum is not None else ""
+    if not obs_text:
+        match = re.search(r"pointing_(\d+)_citlali\.ecsv$", ecsv_path.name)
+        if match:
+            obs_text = match.group(1)
+
+    candidates: List[Path] = []
+    if obs_text:
+        candidates.extend(sorted(ecsv_path.parent.glob(f"toltec_commissioning_a*_pointing_{obs_text}_citlali.fits")))
+        candidates.extend(sorted(ecsv_path.parent.glob(f"*pointing_{obs_text}*.fits")))
+    if not candidates:
+        candidates.extend(sorted(ecsv_path.parent.glob("*pointing*.fits")))
+
+    if not candidates:
+        return None
+
+    try:
+        from astropy.io import fits
+    except Exception:
+        return None
+
+    header_keys_deg_first = (
+        "MEAN_EL",
+        "ELEVATIO",
+        "EL",
+    )
+    header_keys_rad_or_deg = (
+        "HEADER.TELESCOPE.ELACTPOS",
+        "HEADER.TELESCOPE.ELDESPOS",
+        "HEADER.M2.ELCMD",
+        "HEADER.SOURCE.ELOBSMIN",
+        "HEADER.SOURCE.ELOBSMAX",
+    )
+
+    for fits_path in candidates:
+        try:
+            header = fits.getheader(str(fits_path), 0)
+        except Exception:
+            continue
+
+        for key in header_keys_deg_first:
+            val = _parse_float(header.get(key))
+            if val is not None:
+                return float(val)
+        for key in header_keys_rad_or_deg:
+            val = _parse_float(header.get(key))
+            if val is not None:
+                return _as_degrees_if_needed(float(val))
+
+    return None
+
+
+def extract_source_elevation_deg(table: Table, ecsv_path: Path) -> Optional[float]:
     meta_keys = (
         "source_elevation_deg",
         "source_elevation",
@@ -524,6 +584,44 @@ def extract_source_elevation_deg(table: Table) -> Optional[float]:
         val = _parse_float(meta_lookup.get(key))
         if val is not None:
             return val
+
+    # Heuristic metadata search for non-standard elevation keys.
+    # Prefer source/telescope/obs-related entries and ignore tiny point-model corrections.
+    scored_meta: List[tuple[int, float]] = []
+    elev_key_pattern = re.compile(r"(^|[._])(el|elev|elevation|alt|altitude)([._]|$)")
+    for key, raw_val in meta_lookup.items():
+        if not (
+            elev_key_pattern.search(key)
+            or "elactpos" in key
+            or "eldespos" in key
+            or "obsel" in key
+            or "mean_el" in key
+            or "source.el" in key
+        ):
+            continue
+        val = _parse_float(raw_val)
+        if val is None:
+            continue
+        deg = _as_degrees_if_needed(float(val))
+        if not (5.0 <= deg <= 90.0):
+            continue
+
+        score = 0
+        if "source" in key:
+            score += 4
+        if "mean" in key:
+            score += 3
+        if "telescope" in key:
+            score += 2
+        if any(tok in key for tok in ("elactpos", "eldespos", "obsel", "elev")):
+            score += 2
+        if "pointmodel" in key:
+            score -= 3
+        scored_meta.append((score, deg))
+
+    if scored_meta:
+        scored_meta.sort(key=lambda x: x[0], reverse=True)
+        return scored_meta[0][1]
 
     col_names = (
         "source_elevation_deg",
@@ -547,7 +645,8 @@ def extract_source_elevation_deg(table: Table) -> Optional[float]:
             val = _parse_float(raw_val)
             if val is not None:
                 return val
-    return None
+
+    return _extract_elevation_from_fits(ecsv_path=ecsv_path, obsnum=table.meta.get("obsnum"))
 
 
 def resolve_output_path_with_obsnum(output_path: Path, obsnum: Optional[str]) -> Path:
